@@ -145,7 +145,7 @@ class DBManager:
             ]                   
 
     def recall_message(self, msg_id, sender_id):
-        """撤回功能：仅限发送者本人"""
+        """撤回功能"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE messages SET is_recalled = 1 WHERE msg_id = ? AND sender_id = ?", 
