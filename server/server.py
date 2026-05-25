@@ -11,12 +11,16 @@ if ROOT_DIR not in sys.path:
 
 from common.protocol import recv_json, send_json
 from server.database.db_manager import DBManager
+from server.llm_client import ask_llm
 
 
 HOST = "127.0.0.1"
 PORT = 9000
 HEARTBEAT_CHECK_INTERVAL = 5
 HEARTBEAT_TIMEOUT = 30
+RECALL_WINDOW_SECONDS = 120
+AI_NAME = "AI"
+AI_TRIGGER = "@AI"
 
 clients = []
 online_users = {}
@@ -24,6 +28,15 @@ last_heartbeat = {}
 groups = {}
 clients_lock = threading.Lock()
 db_manager = DBManager()
+
+RECALL_FAILURE_MESSAGES = {
+    "invalid_id": "撤回失败：消息 ID 无效",
+    "not_found": "撤回失败：消息不存在",
+    "permission_denied": "撤回失败：只能撤回自己发送的消息",
+    "already_recalled": "撤回失败：该消息已被撤回",
+    "expired": "撤回失败：消息已超过 2 分钟可撤回时间",
+    "update_failed": "撤回失败：消息状态已变化",
+}
 
 
 def broadcast(message, exclude_sock=None):
@@ -161,11 +174,13 @@ def handle_private_message(sender_sock, sender_name, message):
         )
         return
 
+    message_id = db_manager.save_private_message(sender_name, target_name, content)
     try:
         send_json(
             target_sock,
             {
                 "type": "private_msg",
+                "message_id": message_id,
                 "from": sender_name,
                 "content": content,
             },
@@ -178,7 +193,15 @@ def handle_private_message(sender_sock, sender_name, message):
         )
         return
 
-    db_manager.save_private_message(sender_name, target_name, content)
+    send_json(
+        sender_sock,
+        {
+            "type": "message_sent",
+            "message_id": message_id,
+            "msg_type": "private",
+            "to": target_name,
+        },
+    )
     send_json(
         sender_sock,
         {
@@ -256,6 +279,62 @@ def handle_group_leave(client_sock, username, message):
     send_json(client_sock, {"type": "system", "content": f"已退出群组 {group_name}"})
 
 
+def extract_ai_prompt(content):
+    """Return the prompt after @AI, or None when the message is not for AI."""
+    text = str(content).strip()
+    trigger_len = len(AI_TRIGGER)
+    if text[:trigger_len].lower() != AI_TRIGGER.lower():
+        return None
+
+    rest = text[trigger_len:]
+    if rest and not rest[0].isspace() and rest[0] not in ":：":
+        return None
+
+    return rest.lstrip(" :：")
+
+
+def send_group_message(group_name, sender_name, content):
+    """Send one group message to currently online members."""
+    outgoing = {
+        "type": "group_msg",
+        "group": group_name,
+        "from": sender_name,
+        "content": content,
+    }
+
+    disconnected = []
+    with clients_lock:
+        members = groups.get(group_name, set())
+        targets = [
+            (member_name, online_users[member_name])
+            for member_name in list(members)
+            if member_name in online_users
+        ]
+
+    for member_name, member_sock in targets:
+        try:
+            send_json(member_sock, outgoing)
+        except OSError:
+            disconnected.append((member_sock, member_name))
+
+    for member_sock, member_name in disconnected:
+        remove_client(member_sock, member_name)
+
+
+def handle_ai_group_reply(group_name, sender_name, prompt):
+    """Ask the LLM and send the answer back to the group."""
+    if not prompt:
+        reply = "请在 @AI 后面输入问题，例如：@AI 帮我解释一下心跳机制。"
+    else:
+        try:
+            reply = ask_llm(prompt, sender_name, group_name)
+        except Exception as exc:
+            reply = f"AI 暂时无法回复：{exc}"
+
+    send_group_message(group_name, AI_NAME, reply)
+    db_manager.save_group_message(AI_NAME, group_name, reply)
+
+
 def handle_group_message(client_sock, username, message):
     """Send a chat message to online members of one group."""
     group_name = str(message.get("group", "")).strip()
@@ -287,8 +366,10 @@ def handle_group_message(client_sock, username, message):
         send_json(client_sock, {"type": "error", "content": f"你不在群组 {group_name} 中"})
         return
 
+    message_id = db_manager.save_group_message(username, group_name, content)
     outgoing = {
         "type": "group_msg",
+        "message_id": message_id,
         "group": group_name,
         "from": username,
         "content": content,
@@ -303,7 +384,80 @@ def handle_group_message(client_sock, username, message):
     for member_sock, member_name in disconnected:
         remove_client(member_sock, member_name)
 
-    db_manager.save_group_message(username, group_name, content)
+    send_json(
+        client_sock,
+        {
+            "type": "message_sent",
+            "message_id": message_id,
+            "msg_type": "group",
+            "group": group_name,
+        },
+    )
+
+    ai_prompt = extract_ai_prompt(content)
+    if ai_prompt is not None:
+        thread = threading.Thread(
+            target=handle_ai_group_reply,
+            args=(group_name, username, ai_prompt),
+            daemon=True,
+        )
+        thread.start()
+
+
+def handle_recall_message(client_sock, username, message):
+    """Recall one recently sent private or group message and notify recipients."""
+    message_id = message.get("message_id", message.get("id", message.get("msg_id")))
+    success, reason, recalled = db_manager.recall_message(
+        message_id,
+        username,
+        within_seconds=RECALL_WINDOW_SECONDS,
+    )
+    if not success:
+        send_json(
+            client_sock,
+            {
+                "type": "error",
+                "content": RECALL_FAILURE_MESSAGES.get(reason, "撤回失败"),
+            },
+        )
+        return
+
+    notice = {
+        "type": "recall_notice",
+        "message_id": recalled["id"],
+        "msg_type": recalled["msg_type"],
+        "from": username,
+        "content": f"{username} 撤回了一条消息",
+    }
+    target_socks = []
+
+    with clients_lock:
+        if recalled["msg_type"] == "private":
+            notice["to"] = recalled.get("receiver")
+            recipients = {recalled.get("sender"), recalled.get("receiver")}
+            target_socks = [
+                (recipient, online_users[recipient])
+                for recipient in recipients
+                if recipient in online_users
+            ]
+        elif recalled["msg_type"] == "group":
+            group_name = recalled.get("group_name")
+            notice["group"] = group_name
+            target_socks = [
+                (member_name, online_users[member_name])
+                for member_name in list(groups.get(group_name, set()))
+                if member_name in online_users
+            ]
+
+    disconnected = []
+    for recipient, sock in target_socks:
+        try:
+            send_json(sock, notice)
+        except OSError:
+            disconnected.append((sock, recipient))
+
+    for sock, recipient in disconnected:
+        remove_client(sock, recipient)
 
 
 def handle_history(client_sock, username):
@@ -367,6 +521,8 @@ def handle_client(client_sock, address):
                 handle_group_leave(client_sock, username, message)
             elif msg_type == "group_msg":
                 handle_group_message(client_sock, username, message)
+            elif msg_type in ("recall", "recall_message", "recall_last", "recall_request"):
+                handle_recall_message(client_sock, username, message)
             elif msg_type == "history":
                 handle_history(client_sock, username)
             elif msg_type == "online_list":

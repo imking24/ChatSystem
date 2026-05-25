@@ -29,6 +29,7 @@ class ChatClientGUI:
         self.heartbeat_stop_event = threading.Event()
         self.receive_thread = None
         self.heartbeat_thread = None
+        self.last_sent_message_id = None
 
         self.chat_mode = tk.StringVar(value="private")
         self.status_var = tk.StringVar(value="未连接")
@@ -197,8 +198,7 @@ class ChatClientGUI:
         self.message_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.message_entry.bind("<Return>", lambda _event: self.send_message())
         ttk.Button(input_frame, text="发送", width=10, style="Accent.TButton", command=self.send_message).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(input_frame, text="发送文件", width=10, command=self.send_file).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(input_frame, text="@AI", width=8, command=self.send_ai_message).grid(row=0, column=3)
+        ttk.Button(input_frame, text="@AI", width=8, command=self.send_ai_message).grid(row=0, column=2)
 
     def configure_text_tags(self):
         self.chat_text.tag_configure("system", foreground="#6b7280")
@@ -361,6 +361,17 @@ class ChatClientGUI:
             sender = message.get("from", "unknown")
             content = message.get("content", "")
             self.append_message(f"[群聊][{group}][{sender}] {content}", "group")
+        elif msg_type == "message_sent":
+            message_id = message.get("message_id")
+            if message_id is not None:
+                self.last_sent_message_id = message_id
+                self.set_status(f"最近消息 ID：{message_id}，2 分钟内可撤回")
+        elif msg_type == "recall_notice":
+            message_id = message.get("message_id")
+            sender = message.get("from", "unknown")
+            if message_id == self.last_sent_message_id:
+                self.last_sent_message_id = None
+            self.append_message(f"[撤回] {sender} 撤回了一条消息", "system")
         elif msg_type == "chat":
             self.append_message(message.get("content", ""), "normal")
         elif msg_type == "history":
@@ -458,8 +469,11 @@ class ChatClientGUI:
             self.set_status("正在拉取历史消息")
 
     def recall_last(self):
-        self.append_message("[系统] 当前 server.py 未处理 recall_last，撤回功能待服务器接入。", "system")
-        self.set_status("撤回功能待服务器接入")
+        if self.last_sent_message_id is None:
+            self.set_status("暂无可撤回的最近消息")
+            return
+        if self.send_json({"type": "recall", "message_id": self.last_sent_message_id}):
+            self.set_status("已发送撤回请求")
 
     def send_message(self):
         target = self.target_var.get().strip()
@@ -486,10 +500,6 @@ class ChatClientGUI:
             self.set_status("发送成功")
             if mode == "private":
                 self.append_message(f"[我 -> {target}] {content}", "private")
-
-    def send_file(self):
-        self.append_message("[系统] 文件发送功能待接入", "system")
-        self.set_status("文件发送功能待接入")
 
     def send_ai_message(self):
         if self.chat_mode.get() != "group":

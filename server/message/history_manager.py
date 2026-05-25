@@ -32,7 +32,7 @@ class HistoryManager:
         """
         try:
             # 调用底层 recall_message，检查 msg_id 和 sender_id 是否匹配
-            success = self.db.recall_message(msg_id, sender_id)
+            success, reason, _message = self.db.recall_message(msg_id, sender_id)
             
             if success:
                 return {"status": "success", "message": "消息已撤回"}

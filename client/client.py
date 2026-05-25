@@ -79,6 +79,10 @@ def receive_loop(sock, stop_event):
             print(f"\n[online] {', '.join(users) if users else '当前没有在线用户'}")
         elif msg_type == "history":
             print_history(message.get("messages", []))
+        elif msg_type == "message_sent":
+            print(f"\n[system] 消息已发送，ID: {message.get('message_id')}")
+        elif msg_type == "recall_notice":
+            print(f"\n[撤回] {message.get('content', '有一条消息已撤回')}")
         elif msg_type == "error":
             print(f"\n[error] {message.get('content', '')}")
         else:
@@ -145,7 +149,7 @@ def main():
         return
 
     print("[client] type messages and press Enter.")
-    print("[client] commands: /msg <用户名> <消息内容>, /create_group <群名>, /join_group <群名>, /leave_group <群名>, /gmsg <群名> <消息内容>, /history, /online, /stop_heartbeat, /quit")
+    print("[client] commands: /msg <用户名> <消息内容>, /create_group <群名>, /join_group <群名>, /leave_group <群名>, /gmsg <群名> <消息内容>, /recall <消息ID>, /history, /online, /stop_heartbeat, /quit")
 
     receiver = threading.Thread(
         target=receive_loop,
@@ -173,6 +177,17 @@ def main():
                 continue
             if text == "/history":
                 send_json_locked(sock, {"type": "history"}, send_lock)
+                continue
+            if text == "/recall":
+                print("用法：/recall <消息ID>")
+                continue
+            if text.startswith("/recall "):
+                parts = text.split(maxsplit=1)
+                msg_id = parts[1].strip()
+                if not msg_id:
+                    print("用法：/recall <消息ID>")
+                    continue
+                send_json_locked(sock, {"type": "recall", "message_id": msg_id}, send_lock)
                 continue
             if text == "/stop_heartbeat":
                 heartbeat_stop_event.set()
