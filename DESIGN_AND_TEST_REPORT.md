@@ -2,7 +2,6 @@
 
 **概述**:
 - **项目**: ChatSystem — 基于 TCP 的分布式聊天系统，支持私聊/群聊、消息撤回、历史查询、AI 群助手与数据库持久化。
-- **目标读者**: 开发者、测试工程师、项目评审人员。
 
 **系统架构概览**:
 - **传输层**: 基于 TCP socket 的自定义 JSON Lines 协议，消息编码/解码见协议模块。
@@ -25,43 +24,43 @@
   - 在线维护: 在内存字典 `online_users`、`last_heartbeat` 中记录，会在 [heartbeat_monitor](server/server.py#L20-L60) 定期检测超时并下线（心跳超时阈值见常量 `HEARTBEAT_TIMEOUT`）。
   - 协议: 登录消息使用 `type: "login"`，服务器回应 `login_success` 或 `login_failed`。协议读写封装见 [common/protocol.py](common/protocol.py#L1-L80)。
 
-2. **公聊 / 广播消息**
+1. **公聊 / 广播消息**
 - 设计思路: 简单广播模型，收到 `chat` 类型消息后将带发送者标识的文本广播给所有在线用户，服务器并不把每条广播写入数据库（可扩展）。
 - 具体实现:
   - 实现函数: [server/server.py](server/server.py#L200-L260) 中处理 `msg_type == 'chat'` 的分支与 `broadcast()` 函数。
   - 消息格式: `{"type": "chat", "content": "..."}`，客户端接收后按类型显示。
 
-3. **私聊**
+1. **私聊**
 - 设计思路: 通过 `private_msg` 类型将消息发送给目标用户，若目标在线则直接转发并在数据库保存私聊记录。
 - 具体实现:
   - 实现函数: [server/server.py](server/server.py#L140-L200) 中 `handle_private_message`。
   - 持久化: 使用 `db_manager.save_private_message(...)` 保存，消息发送成功后服务器会返回 `message_sent` 给发送者并将 `private_msg` 转发给接收者。
 
-4. **群组管理与群聊**
+1. **群组管理与群聊**
 - 设计思路: 轻量内存群组管理，支持建群、入群、退群，群消息同时写入 DB 并转发给在线群成员。AI 群助手以 `@AI` 为触发器，单独在后台线程调用 LLM。
 - 具体实现:
   - 群操作: `group_create`, `group_join`, `group_leave` 在 [server/server.py](server/server.py#L120-L180) 的对应函数实现。
   - 群消息: `group_msg` 处理见 [server/server.py](server/server.py#L260-L360)。消息写入数据库: `db_manager.save_group_message(...)`。群内 AI 触发: `extract_ai_prompt` + 新线程调用 `handle_ai_group_reply`（见 [server/server.py](server/server.py#L300-L360)）。
   - AI 调用: [server/llm_client.py](server/llm_client.py#L1-L120) 中 `ask_llm` 函数通过 OpenAI 兼容 SDK 调用外部模型。
 
-5. **消息撤回（Recall）**
+1. **消息撤回（Recall）**
 - 设计思路: 在可回撤时间窗口内（默认 120 秒）允许发送者撤回消息；撤回会修改数据库记录并通知受影响的客户端显示撤回提示。
 - 具体实现:
   - 实现函数: [server/server.py](server/server.py#L360-L460) 中 `handle_recall_message`。数据库逻辑在 `db_manager.recall_message(...)` 中实现（参见 DB 文件）。
   - 错误码与提示: `RECALL_FAILURE_MESSAGES` 常量统一管理错误提示。
 
-6. **历史记录检索**
+1. **历史记录检索**
 - 设计思路: 客户端可请求近期历史（默认 N 条），服务器查询数据库并返回结构化消息列表，客户端按类型渲染为私聊/群聊/系统条目。
 - 具体实现:
   - 处理函数: [server/server.py](server/server.py#L460-L500) 中 `handle_history`，调用 `db_manager.get_recent_history(...)`。
   - 客户端打印/展示: [client/client.py](client/client.py#L1-L200) 中 `print_history` 用于命令行客户端的展示格式。
 
-7. **心跳/在线检测**
+1. **心跳/在线检测**
 - 设计思路: 客户端定期发送 `heartbeat`；服务器维护 `last_heartbeat` 时间戳并由 `heartbeat_monitor` 周期检测超时用户并下线。
 - 具体实现:
   - 客户端心跳发送与服务器端处理参见 [client/client.py](client/client.py#L120-L200) 与 [server/server.py](server/server.py#L180-L220)。
 
-8. **数据库设计与迁移**
+1. **数据库设计与迁移**
 - 设计思路: 采用 SQLite，表结构支持向后迁移（检测老表结构并迁移），消息表包含撤回标记与时间，用户表保存密码与最后心跳。
 - 具体实现:
   - 数据库初始化与迁移逻辑: [server/database/db_manager.py](server/database/db_manager.py#L1-L200)。
@@ -100,8 +99,7 @@
      - 实际: `heartbeat_monitor` 在检测到超时后调用 `mark_user_offline`，符合预期（参见 [server/server.py#L10-L60]）。
 
 **测试截图（演示）**:
-- 请将测试时的客户端 GUI 截图放入 `docs/screenshots/` 文件夹，文件名示例：`screenshot1.png`, `screenshot2.png`。
-- 附：本次测试记录包含两张演示截图，说明如下：
+本次测试记录包含两张演示截图，说明如下：
   - screenshot1.png: 登录后群聊与 AI 回复示例（界面显示 @AI 触发与 AI 返回的绿色文本）。
   - screenshot2.png: 私聊/历史记录与群组列表显示（显示用户列表、历史拉取结果与撤回提示）。
 
