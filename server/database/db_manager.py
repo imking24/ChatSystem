@@ -1,6 +1,7 @@
 import sqlite3
 import os
 from datetime import datetime
+import threading
 
 class DBManager:
     def __init__(self, db_path=None):
@@ -13,11 +14,12 @@ class DBManager:
             self.db_path = os.path.join(base_dir, "chat_system.db")
         else:
             self.db_path = db_path
+        self._lock = threading.RLock()
         self._init_db()
 
     def _get_connection(self):
         """获取数据库连接，设置 row_factory 方便通过列名访问数据"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row 
         return conn
 
@@ -37,22 +39,57 @@ class DBManager:
                 )
             ''')
             
-            # 2. 消息表：普通消息与文件元数据。0: 正常, 1: 已撤回
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS messages (
-                    msg_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    sender_id TEXT NOT NULL,
-                    receiver_id TEXT NOT NULL,
-                    content TEXT,                        
-                    msg_type TEXT NOT NULL,              
-                    filename TEXT,                       
-                    file_size INTEGER,                   
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    is_recalled INTEGER DEFAULT 0        
-                )
-            ''')
+            self._ensure_messages_table(cursor)
             conn.commit()
             print(">>> [DBManager] 数据库协议适配完成，表结构就绪。")
+
+    def _ensure_messages_table(self, cursor):
+        """创建或迁移消息表到当前聊天系统需要的结构。"""
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+        if cursor.fetchone() is None:
+            self._create_messages_table(cursor)
+            return
+
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        required = {"id", "sender", "receiver", "group_name", "content", "msg_type", "timestamp"}
+        if required.issubset(columns):
+            if "is_recalled" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN is_recalled INTEGER DEFAULT 0")
+            if "recalled_at" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN recalled_at DATETIME")
+            return
+
+        cursor.execute("ALTER TABLE messages RENAME TO messages_old")
+        self._create_messages_table(cursor)
+
+        old_columns = columns
+        sender_expr = "sender_id" if "sender_id" in old_columns else "''"
+        receiver_expr = "receiver_id" if "receiver_id" in old_columns else "''"
+        content_expr = "content" if "content" in old_columns else "''"
+        msg_type_expr = "msg_type" if "msg_type" in old_columns else "'chat'"
+        timestamp_expr = "timestamp" if "timestamp" in old_columns else "CURRENT_TIMESTAMP"
+        cursor.execute(f'''
+            INSERT INTO messages (sender, receiver, group_name, content, msg_type, timestamp)
+            SELECT {sender_expr}, {receiver_expr}, NULL, {content_expr}, {msg_type_expr}, {timestamp_expr}
+            FROM messages_old
+        ''')
+        cursor.execute("DROP TABLE messages_old")
+
+    def _create_messages_table(self, cursor):
+        cursor.execute('''
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                receiver TEXT,
+                group_name TEXT,
+                content TEXT NOT NULL,
+                msg_type TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_recalled INTEGER DEFAULT 0,
+                recalled_at DATETIME
+            )
+        ''')
 
     # --- 用户管理模块  ---
 
@@ -102,17 +139,75 @@ class DBManager:
 
     # --- 消息存储与查询 ---
 
+    def save_private_message(self, sender, receiver, content):
+        """保存一条私聊消息。"""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO messages (sender, receiver, group_name, content, msg_type)
+                    VALUES (?, ?, NULL, ?, 'private')
+                ''', (sender, receiver, content))
+                conn.commit()
+                return cursor.lastrowid
+
+    def save_group_message(self, sender, group_name, content):
+        """保存一条群聊消息。"""
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO messages (sender, receiver, group_name, content, msg_type)
+                    VALUES (?, NULL, ?, ?, 'group')
+                ''', (sender, group_name, content))
+                conn.commit()
+                return cursor.lastrowid
+
+    def get_recent_history(self, username, group_names=None, limit=20):
+        """查询用户最近的相关私聊和群聊消息。"""
+        group_names = list(group_names or [])
+
+        private_clause = "(msg_type = 'private' AND (sender = ? OR receiver = ?))"
+        params = [username, username]
+
+        if group_names:
+            placeholders = ", ".join("?" for _ in group_names)
+            where_clause = f"{private_clause} OR (msg_type = 'group' AND group_name IN ({placeholders}))"
+            params.extend(group_names)
+        else:
+            where_clause = private_clause
+
+        params.append(limit)
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f'''
+                    SELECT
+                        id,
+                        sender,
+                        receiver,
+                        group_name,
+                        CASE WHEN is_recalled = 1 THEN '该消息已撤回' ELSE content END AS content,
+                        msg_type,
+                        timestamp,
+                        is_recalled,
+                        recalled_at
+                    FROM messages
+                    WHERE {where_clause}
+                    ORDER BY id DESC
+                    LIMIT ?
+                ''', params)
+                rows = [dict(row) for row in cursor.fetchall()]
+
+        return list(reversed(rows))
+
     def save_chat_message(self, msg_dict):
         """ 'message' 类型"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO messages (sender_id, receiver_id, content, msg_type, timestamp) 
-                VALUES (?, ?, ?, ?, ?)
-            ''', (msg_dict['sender'], msg_dict['receiver'], msg_dict['content'], 
-                  msg_dict['type'], msg_dict['timestamp']))
-            conn.commit()
-            return cursor.lastrowid
+        return self.save_private_message(
+            msg_dict['sender'],
+            msg_dict['receiver'],
+            msg_dict['content'],
+        )
 
     def save_file_info(self, msg_dict):
         """ 'file_start' 类型：记录文件传输任务"""
@@ -130,28 +225,72 @@ class DBManager:
         """
         查询历史记录：过滤掉心跳包和文件块，只展示具有展示意义的内容
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            # 只筛选普通对话和文件发送记录
-            cursor.execute('''
-                SELECT * FROM messages 
-                WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
-                AND msg_type IN ('message', 'file_start')
-                ORDER BY timestamp DESC LIMIT ?
-            ''', (user1, user2, user2, user1, limit))
-            return [
-                {**dict(row), 'content': '此消息已撤回' if row['is_recalled'] else row['content']} 
-                for row in cursor.fetchall()
-            ]                   
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT
+                        id,
+                        sender,
+                        receiver,
+                        group_name,
+                        CASE WHEN is_recalled = 1 THEN '该消息已撤回' ELSE content END AS content,
+                        msg_type,
+                        timestamp,
+                        is_recalled,
+                        recalled_at
+                    FROM messages 
+                    WHERE msg_type = 'private'
+                    AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
+                    ORDER BY id DESC LIMIT ?
+                ''', (user1, user2, user2, user1, limit))
+                return [dict(row) for row in cursor.fetchall()]
 
-    def recall_message(self, msg_id, sender_id):
+    def recall_message(self, msg_id, sender_id, within_seconds=120):
         """撤回功能"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE messages SET is_recalled = 1 WHERE msg_id = ? AND sender_id = ?", 
-                           (msg_id, sender_id))
-            conn.commit()
-            return cursor.rowcount > 0
+        try:
+            msg_id = int(msg_id)
+        except (TypeError, ValueError):
+            return False, "invalid_id", None
+
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, sender, receiver, group_name, content, msg_type, timestamp, is_recalled
+                    FROM messages
+                    WHERE id = ?
+                ''', (msg_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    return False, "not_found", None
+
+                message = dict(row)
+                if message["sender"] != sender_id:
+                    return False, "permission_denied", message
+                if message.get("is_recalled"):
+                    return False, "already_recalled", message
+
+                cursor.execute(
+                    "SELECT strftime('%s', 'now') - strftime('%s', timestamp) AS elapsed FROM messages WHERE id = ?",
+                    (msg_id,),
+                )
+                elapsed = cursor.fetchone()["elapsed"]
+                if elapsed is None or elapsed > within_seconds:
+                    return False, "expired", message
+
+                cursor.execute('''
+                    UPDATE messages
+                    SET is_recalled = 1, recalled_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND sender = ? AND is_recalled = 0
+                ''', (msg_id, sender_id))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return False, "update_failed", message
+
+                message["is_recalled"] = 1
+                message["content"] = "该消息已撤回"
+                return True, "ok", message
 
 # --- 模块测试逻辑 ---
 if __name__ == "__main__":
