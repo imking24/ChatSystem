@@ -3,7 +3,7 @@ import socket
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 
 HOST = "127.0.0.1"
@@ -29,7 +29,9 @@ class ChatClientGUI:
         self.heartbeat_stop_event = threading.Event()
         self.receive_thread = None
         self.heartbeat_thread = None
-        self.last_sent_message_id = None
+
+        # 存储消息ID到聊天文本位置的映射
+        self.message_map = {}  # {msg_id: (start_index, end_index, sender)}
 
         self.chat_mode = tk.StringVar(value="private")
         self.status_var = tk.StringVar(value="未连接")
@@ -162,7 +164,7 @@ class ChatClientGUI:
         ttk.Radiobutton(controls, text="私聊", variable=self.chat_mode, value="private").grid(row=0, column=2, padx=(0, 6))
         ttk.Radiobutton(controls, text="群聊", variable=self.chat_mode, value="group").grid(row=0, column=3, padx=(0, 12))
         ttk.Button(controls, text="拉取历史", width=10, command=self.request_history).grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(controls, text="撤回上一条", width=12, command=self.recall_last).grid(row=0, column=5)
+        ttk.Button(controls, text="撤回消息", width=12, command=self.recall_message).grid(row=0, column=5)
 
         chat_frame = ttk.Frame(right)
         chat_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
@@ -198,7 +200,8 @@ class ChatClientGUI:
         self.message_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.message_entry.bind("<Return>", lambda _event: self.send_message())
         ttk.Button(input_frame, text="发送", width=10, style="Accent.TButton", command=self.send_message).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(input_frame, text="@AI", width=8, command=self.send_ai_message).grid(row=0, column=2)
+        ttk.Button(input_frame, text="发送文件", width=10, command=self.send_file).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(input_frame, text="@AI", width=8, command=self.send_ai_message).grid(row=0, column=3)
 
     def configure_text_tags(self):
         self.chat_text.tag_configure("system", foreground="#6b7280")
@@ -207,6 +210,7 @@ class ChatClientGUI:
         self.chat_text.tag_configure("group", foreground="#16a34a")
         self.chat_text.tag_configure("ai", foreground="#9333ea")
         self.chat_text.tag_configure("normal", foreground="#111827")
+        self.chat_text.tag_configure("recall", foreground="#ef4444", font=("Microsoft YaHei UI", 9, "italic"))
 
     def set_status(self, text):
         if threading.current_thread() is threading.main_thread():
@@ -214,19 +218,64 @@ class ChatClientGUI:
         else:
             self.root.after(0, self.status_var.set, text)
 
-    def append_message(self, text, tag=None):
+    def append_message(self, text, tag=None, msg_id=None, sender=None):
+        """添加消息到聊天框，如果提供了msg_id则记录位置"""
         tag = tag or "normal"
 
         def update():
             self.chat_text.configure(state="normal")
+            start_pos = self.chat_text.index("end-1c")
             self.chat_text.insert("end", text + "\n", tag)
+            end_pos = self.chat_text.index("end-1c")
             self.chat_text.configure(state="disabled")
             self.chat_text.see("end")
+            
+            if msg_id:
+                self.message_map[msg_id] = (start_pos, end_pos, sender)
 
         if threading.current_thread() is threading.main_thread():
             update()
         else:
             self.root.after(0, update)
+
+    def delete_message_by_id(self, msg_id):
+        """根据消息ID删除聊天框中的消息"""
+        if msg_id not in self.message_map:
+            return False
+        
+        start_pos, end_pos, sender = self.message_map[msg_id]
+        
+        def delete():
+            self.chat_text.configure(state="normal")
+            self.chat_text.delete(start_pos, end_pos)
+            line_end = self.chat_text.index(f"{start_pos} lineend + 1c")
+            self.chat_text.delete(start_pos, line_end)
+            self.chat_text.configure(state="disabled")
+            del self.message_map[msg_id]
+        
+        self.root.after(0, delete)
+        return True
+
+    def replace_with_recall_notice(self, msg_id, sender):
+        """将消息替换为撤回提示"""
+        if msg_id not in self.message_map:
+            return False
+        
+        start_pos, end_pos, msg_sender = self.message_map[msg_id]
+        
+        def replace():
+            self.chat_text.configure(state="normal")
+            self.chat_text.delete(start_pos, end_pos)
+            line_end = self.chat_text.index(f"{start_pos} lineend + 1c")
+            self.chat_text.delete(start_pos, line_end)
+            recall_text = f"「{sender} 撤回了消息」\n"
+            self.chat_text.insert(start_pos, recall_text, "recall")
+            self.chat_text.configure(state="disabled")
+            new_end = self.chat_text.index(f"{start_pos} lineend + 1c")
+            self.message_map[msg_id] = (start_pos, new_end, msg_sender)
+        
+        self.root.after(0, replace)
+        return True
 
     def connect_server(self):
         if self.connected:
@@ -264,20 +313,51 @@ class ChatClientGUI:
         self.append_message(f"[系统] 已连接到 {host}:{port}", "system")
 
     def register_user(self):
-        self.append_message("[系统] 当前 server.py 未处理 register 消息，请直接使用用户名登录；密码输入框已保留用于后续服务器扩展。", "system")
-        self.set_status("注册功能待服务器接入")
-
-    def login(self):
+        """发送注册请求"""
         if not self.ensure_connected():
             return
 
         username = self.username_var.get().strip()
+        password = self.password_var.get().strip()
+
         if not username:
             self.set_status("错误：用户名不能为空")
             return
+        if not password:
+            self.set_status("错误：密码不能为空")
+            return
+        if len(password) < 6:
+            self.set_status("错误：密码长度不能少于6位")
+            return
+
+        self.send_json({
+            "type": "register",
+            "username": username,
+            "password": password
+        })
+        self.set_status("正在注册...")
+
+    def login(self):
+        """发送登录请求"""
+        if not self.ensure_connected():
+            return
+
+        username = self.username_var.get().strip()
+        password = self.password_var.get().strip()
+
+        if not username:
+            self.set_status("错误：用户名不能为空")
+            return
+        if not password:
+            self.set_status("错误：密码不能为空")
+            return
 
         self.username = username
-        self.send_json({"type": "login", "username": username})
+        self.send_json({
+            "type": "login",
+            "username": username,
+            "password": password
+        })
 
     def ensure_connected(self):
         if not self.connected or self.sock is None:
@@ -329,6 +409,16 @@ class ChatClientGUI:
 
     def handle_server_message(self, message):
         msg_type = message.get("type")
+        
+        msg_id = message.get("msg_id") or message.get("_msg_id")
+        msg_sender = message.get("from") or message.get("sender")
+        
+        show_id = False
+        if msg_id and message.get("msg_id"):
+            if msg_sender == self.username:
+                show_id = True
+        
+        id_prefix = f"[ID: {msg_id}] " if show_id else ""
 
         if msg_type == "system":
             self.append_message(f"[系统] {message.get('content', '')}", "system")
@@ -336,6 +426,13 @@ class ChatClientGUI:
             content = message.get("content", "")
             self.append_message(f"[错误] {content}", "error")
             self.set_status(f"错误：{content}")
+        elif msg_type == "register_success":
+            self.append_message(f"[系统] {message.get('content', '注册成功')}", "system")
+            self.set_status("注册成功，请登录")
+        elif msg_type == "register_failed":
+            content = message.get("content", "")
+            self.append_message(f"[错误] {content}", "error")
+            self.set_status(f"注册失败：{content}")
         elif msg_type == "login_success":
             self.logged_in = True
             content = message.get("content", "登录成功")
@@ -347,7 +444,7 @@ class ChatClientGUI:
             content = message.get("content", "")
             self.logged_in = False
             self.append_message(f"[错误] {content}", "error")
-            self.set_status(f"错误：{content}")
+            self.set_status(f"登录失败：{content}")
         elif msg_type in ("online_list", "online"):
             users = message.get("users", [])
             self.update_online_users(users)
@@ -355,36 +452,33 @@ class ChatClientGUI:
         elif msg_type in ("private_msg", "msg"):
             sender = message.get("from", "unknown")
             content = message.get("content", "")
-            self.append_message(f"[私聊][{sender}] {content}", "private")
+            self.append_message(f"[私聊]{id_prefix}[{sender}] {content}", "private", msg_id=msg_id, sender=sender)
         elif msg_type in ("group_msg", "gmsg"):
             group = message.get("group", "unknown")
             sender = message.get("from", "unknown")
             content = message.get("content", "")
-            self.append_message(f"[群聊][{group}][{sender}] {content}", "group")
-        elif msg_type == "message_sent":
-            message_id = message.get("message_id")
-            if message_id is not None:
-                self.last_sent_message_id = message_id
-                self.set_status(f"最近消息 ID：{message_id}，2 分钟内可撤回")
-        elif msg_type == "recall_notice":
-            message_id = message.get("message_id")
-            sender = message.get("from", "unknown")
-            if message_id == self.last_sent_message_id:
-                self.last_sent_message_id = None
-            self.append_message(f"[撤回] {sender} 撤回了一条消息", "system")
+            self.append_message(f"[群聊][{group}]{id_prefix}[{sender}] {content}", "group", msg_id=msg_id, sender=sender)
         elif msg_type == "chat":
-            self.append_message(message.get("content", ""), "normal")
+            content = message.get("content", "")
+            self.append_message(f"{id_prefix}{content}", "normal", msg_id=msg_id, sender=msg_sender)
         elif msg_type == "history":
             self.display_history(message.get("messages", []))
         elif msg_type == "ai_response":
             self.append_message(f"[AI助手] {message.get('content', '')}", "ai")
+        elif msg_type == "recall":
+            sender = message.get("sender", "未知用户")
+            recalled_id = message.get("msg_id", "未知")
+            self.append_message(f"【撤回提示】: 用户 {sender} 撤回了一条消息", "recall")
+            self.replace_with_recall_notice(recalled_id, sender)
         else:
-            self.append_message(f"[调试] {json.dumps(message, ensure_ascii=False)}", "normal")
+            if "content" in message:
+                self.append_message(message.get("content"), "normal")
 
     def update_online_users(self, users):
         self.user_listbox.delete(0, "end")
         for user in users:
-            self.user_listbox.insert("end", user)
+            #if user != self.username:
+                self.user_listbox.insert("end", user)
 
     def display_history(self, messages):
         if not messages:
@@ -397,15 +491,18 @@ class ChatClientGUI:
             msg_type = item.get("msg_type", "")
             sender = item.get("sender", "")
             content = item.get("content", "")
+            msg_id = item.get("msg_id", "")
+            show_id = (sender == self.username)
+            id_prefix = f"[ID: {msg_id}] " if show_id and msg_id else ""
 
             if msg_type == "private":
                 receiver = item.get("receiver", "")
-                self.append_message(f"[历史][私聊][{timestamp}][{sender} -> {receiver}] {content}", "private")
+                self.append_message(f"[历史][私聊]{id_prefix}[{timestamp}][{sender} -> {receiver}] {content}", "private")
             elif msg_type == "group":
                 group = item.get("group_name", "")
-                self.append_message(f"[历史][群聊][{timestamp}][{group}][{sender}] {content}", "group")
+                self.append_message(f"[历史][群聊]{id_prefix}[{timestamp}][{group}][{sender}] {content}", "group")
             else:
-                self.append_message(f"[历史][{timestamp}] {content}", "normal")
+                self.append_message(f"[历史]{id_prefix}[{timestamp}] {content}", "normal")
 
     def format_timestamp(self, timestamp):
         if not timestamp:
@@ -468,12 +565,34 @@ class ChatClientGUI:
         if self.send_json({"type": "history"}):
             self.set_status("正在拉取历史消息")
 
-    def recall_last(self):
-        if self.last_sent_message_id is None:
-            self.set_status("暂无可撤回的最近消息")
+    def recall_message(self):
+        if not self.logged_in:
+            self.set_status("错误：请先登录")
             return
-        if self.send_json({"type": "recall", "message_id": self.last_sent_message_id}):
-            self.set_status("已发送撤回请求")
+
+        input_dialog = tk.Toplevel(self.root)
+        input_dialog.title("消息撤回")
+        input_dialog.geometry("380x150")
+        input_dialog.resizable(False, False)
+        input_dialog.transient(self.root)
+        input_dialog.grab_set()
+
+        ttk.Label(input_dialog, text="请输入要撤回的消息ID (2分钟内):").pack(pady=12)
+        id_var = tk.StringVar()
+        entry = ttk.Entry(input_dialog, textvariable=id_var, width=32)
+        entry.pack(pady=5)
+        entry.focus_set()
+
+        def confirm():
+            target_id = id_var.get().strip()
+            if not target_id:
+                messagebox.showwarning("提示", "ID不能为空")
+                return
+            input_dialog.destroy()
+            self.send_json({"type": "recall_request", "msg_id": target_id})
+            self.set_status(f"已发送撤回请求，ID: {target_id}")
+
+        ttk.Button(input_dialog, text="确定撤回", command=confirm).pack(pady=12)
 
     def send_message(self):
         target = self.target_var.get().strip()
@@ -498,8 +617,10 @@ class ChatClientGUI:
         if self.send_json(data):
             self.message_var.set("")
             self.set_status("发送成功")
-            if mode == "private":
-                self.append_message(f"[我 -> {target}] {content}", "private")
+
+    def send_file(self):
+        self.append_message("[系统] 文件发送功能待接入", "system")
+        self.set_status("文件发送功能待接入")
 
     def send_ai_message(self):
         if self.chat_mode.get() != "group":
@@ -572,3 +693,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
