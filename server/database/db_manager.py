@@ -54,6 +54,10 @@ class DBManager:
         columns = {row["name"] for row in cursor.fetchall()}
         required = {"id", "sender", "receiver", "group_name", "content", "msg_type", "timestamp"}
         if required.issubset(columns):
+            if "is_recalled" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN is_recalled INTEGER DEFAULT 0")
+            if "recalled_at" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN recalled_at DATETIME")
             return
 
         cursor.execute("ALTER TABLE messages RENAME TO messages_old")
@@ -81,7 +85,9 @@ class DBManager:
                 group_name TEXT,
                 content TEXT NOT NULL,
                 msg_type TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_recalled INTEGER DEFAULT 0,
+                recalled_at DATETIME
             )
         ''')
 
@@ -176,7 +182,16 @@ class DBManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(f'''
-                    SELECT id, sender, receiver, group_name, content, msg_type, timestamp
+                    SELECT
+                        id,
+                        sender,
+                        receiver,
+                        group_name,
+                        CASE WHEN is_recalled = 1 THEN '该消息已撤回' ELSE content END AS content,
+                        msg_type,
+                        timestamp,
+                        is_recalled,
+                        recalled_at
                     FROM messages
                     WHERE {where_clause}
                     ORDER BY id DESC
@@ -214,16 +229,68 @@ class DBManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT * FROM messages 
+                    SELECT
+                        id,
+                        sender,
+                        receiver,
+                        group_name,
+                        CASE WHEN is_recalled = 1 THEN '该消息已撤回' ELSE content END AS content,
+                        msg_type,
+                        timestamp,
+                        is_recalled,
+                        recalled_at
+                    FROM messages 
                     WHERE msg_type = 'private'
                     AND ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
                     ORDER BY id DESC LIMIT ?
                 ''', (user1, user2, user2, user1, limit))
                 return [dict(row) for row in cursor.fetchall()]
 
-    def recall_message(self, msg_id, sender_id):
+    def recall_message(self, msg_id, sender_id, within_seconds=120):
         """撤回功能"""
-        return False
+        try:
+            msg_id = int(msg_id)
+        except (TypeError, ValueError):
+            return False, "invalid_id", None
+
+        with self._lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT id, sender, receiver, group_name, content, msg_type, timestamp, is_recalled
+                    FROM messages
+                    WHERE id = ?
+                ''', (msg_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    return False, "not_found", None
+
+                message = dict(row)
+                if message["sender"] != sender_id:
+                    return False, "permission_denied", message
+                if message.get("is_recalled"):
+                    return False, "already_recalled", message
+
+                cursor.execute(
+                    "SELECT strftime('%s', 'now') - strftime('%s', timestamp) AS elapsed FROM messages WHERE id = ?",
+                    (msg_id,),
+                )
+                elapsed = cursor.fetchone()["elapsed"]
+                if elapsed is None or elapsed > within_seconds:
+                    return False, "expired", message
+
+                cursor.execute('''
+                    UPDATE messages
+                    SET is_recalled = 1, recalled_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND sender = ? AND is_recalled = 0
+                ''', (msg_id, sender_id))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    return False, "update_failed", message
+
+                message["is_recalled"] = 1
+                message["content"] = "该消息已撤回"
+                return True, "ok", message
 
 # --- 模块测试逻辑 ---
 if __name__ == "__main__":
