@@ -1,0 +1,19 @@
+# ChatSystem - 实时聊天系统依赖包
+# Python 3.7+
+
+# 核心库（Python内置，无需安装）
+# - socket: TCP网络通信
+# - threading: 多线程支持
+# - json: JSON序列化
+# - sqlite3: 本地数据库
+# - tkinter: GUI（需系统支持）
+# - base64: 文件传输编码
+# - struct: 网络协议打包
+# - uuid: 消息ID生成
+# - pathlib: 文件路径处理
+# - datetime: 时间戳处理
+# - typing: 类型提示
+
+# 可选依赖（根据功能扩展）
+# openai>=0.27.0  # AI集成功能（若启用）
+# requests>=2.28.0  # HTTP请求（若需要）
