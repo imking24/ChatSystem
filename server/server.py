@@ -11,27 +11,32 @@ if ROOT_DIR not in sys.path:
 
 from common.protocol import recv_json, send_json
 from server.database.db_manager import DBManager
-from server.user.session_manager import SessionManager
-from server.user.user_handler import UserHandler
-from server.message.history_manager import HistoryManager
+from server.llm_client import ask_llm
 
 
 HOST = "127.0.0.1"
 PORT = 9000
 HEARTBEAT_CHECK_INTERVAL = 5
 HEARTBEAT_TIMEOUT = 30
-RECALL_LIMIT = 120
+RECALL_WINDOW_SECONDS = 120
+AI_NAME = "AI"
+AI_TRIGGER = "@AI"
 
 clients = []
 online_users = {}
+last_heartbeat = {}
 groups = {}
-recent_messages = {}
-
 clients_lock = threading.Lock()
 db_manager = DBManager()
-user_handler = UserHandler()
-session_manager = SessionManager()
-history_manager = HistoryManager()
+
+RECALL_FAILURE_MESSAGES = {
+    "invalid_id": "撤回失败：消息 ID 无效",
+    "not_found": "撤回失败：消息不存在",
+    "permission_denied": "撤回失败：只能撤回自己发送的消息",
+    "already_recalled": "撤回失败：该消息已被撤回",
+    "expired": "撤回失败：消息已超过 2 分钟可撤回时间",
+    "update_failed": "撤回失败：消息状态已变化",
+}
 
 
 def broadcast(message, exclude_sock=None):
@@ -70,6 +75,8 @@ def remove_client(client_sock, username=None):
             del online_users[username]
             removed_username = username
         if username:
+            last_heartbeat.pop(username, None)
+        if username:
             for members in groups.values():
                 members.discard(username)
 
@@ -95,120 +102,61 @@ def mark_user_offline(client_sock, username, reason):
 
 
 def heartbeat_monitor():
-    """Periodically remove users whose heartbeat has timed out, and clean up expired messages."""
+    """Periodically remove users whose heartbeat has timed out."""
     while True:
         time.sleep(HEARTBEAT_CHECK_INTERVAL)
         now = time.time()
 
-        # 使用 SessionManager 检查超时用户
-        session_manager.check_dead_sessions()
-        
-        # 同步 SessionManager 的超时用户到 online_users
         with clients_lock:
-            active_users = set(session_manager.active_sessions.keys())
-            offline_users = []
-            offline_users_to_remove = []  # 在这里定义！
-            
-            for username in list(online_users.keys()):
-                if username not in active_users:
-                    offline_users.append(username)
-            
-            for username in offline_users:
-                client_sock = online_users.get(username)
-                if client_sock:
-                    offline_users_to_remove.append((username, client_sock))
-        
-        for username, client_sock in offline_users_to_remove:
-            mark_user_offline(client_sock, username, "heartbeat timeout")
-
-        # 清理过期的撤回消息
-        with clients_lock:
-            expired_msg_ids = [
-                msg_id for msg_id, info in recent_messages.items()
-                if now - info["time"] > RECALL_LIMIT
+            expired_users = [
+                (username, online_users[username])
+                for username, last_seen in list(last_heartbeat.items())
+                if username in online_users and now - last_seen > HEARTBEAT_TIMEOUT
             ]
-            for msg_id in expired_msg_ids:
-                recent_messages.pop(msg_id, None)
 
-
-def handle_register(client_sock, message):
-    """处理用户注册请求"""
-    result = user_handler.handle_register(message)
-    
-    if result["status"] == "success":
-        send_json(client_sock, {
-            "type": "register_success",
-            "content": result["message"]
-        })
-    else:
-        send_json(client_sock, {
-            "type": "register_failed",
-            "content": result["message"]
-        })
-
-
-def handle_login(client_sock, message):
-    """处理用户登录请求（带密码验证）"""
-    username = message.get("username", "").strip()
-    password = message.get("password", "").strip()
-    
-    # 调用 UserHandler 验证登录
-    result = user_handler.handle_login({"username": username, "password": password})
-    
-    if result["status"] != "success":
-        send_json(client_sock, {
-            "type": "login_failed",
-            "content": result["message"]
-        })
-        return None
-    
-    # 检查是否已经在线
-    with clients_lock:
-        if username in online_users:
-            send_json(client_sock, {
-                "type": "login_failed",
-                "content": "用户已在其他客户端登录"
-            })
-            return None
-        
-        # 登录成功，添加到在线列表
-        online_users[username] = client_sock
-    
-    # 更新会话管理器的心跳
-    session_manager.update_heartbeat(username)
-    
-    send_json(client_sock, {
-        "type": "login_success",
-        "content": f"登录成功，欢迎 {username}"
-    })
-    
-    return username
+        for username, client_sock in expired_users:
+            mark_user_offline(client_sock, username, "heartbeat timeout")
 
 
 def login_client(client_sock):
-    """处理客户端的登录/注册流程"""
+    """Keep asking this connection for a unique username until login succeeds."""
     while True:
         message = recv_json(client_sock)
         if message is None:
             return None
-        
-        msg_type = message.get("type")
-        
-        if msg_type == "register":
-            handle_register(client_sock, message)
-            continue
-        
-        elif msg_type == "login":
-            username = handle_login(client_sock, message)
-            if username:
-                return username
-            continue
-        
-        else:
+
+        if message.get("type") != "login":
             send_json(
                 client_sock,
-                {"type": "login_failed", "content": "请先注册或登录"},
+                {"type": "login_failed", "content": "请先登录"},
             )
+            continue
+
+        username = str(message.get("username", "")).strip()
+        if not username:
+            send_json(
+                client_sock,
+                {"type": "login_failed", "content": "用户名不能为空"},
+            )
+            continue
+
+        with clients_lock:
+            if username in online_users:
+                is_available = False
+            else:
+                online_users[username] = client_sock
+                last_heartbeat[username] = time.time()
+                is_available = True
+
+        if not is_available:
+            send_json(
+                client_sock,
+                {"type": "login_failed", "content": "用户名已在线"},
+            )
+            continue
+
+        send_json(client_sock, {"type": "login_success", "content": "登录成功"})
+        return username
 
 
 def handle_private_message(sender_sock, sender_name, message):
@@ -226,25 +174,15 @@ def handle_private_message(sender_sock, sender_name, message):
         )
         return
 
-    msg_id = str(time.time_ns())
-    with clients_lock:
-        recent_messages[msg_id] = {
-            "sender": sender_name,
-            "time": time.time(),
-            "type": "private",
-            "target": [sender_name, target_name],
-            "content": content
-        }
-
-    # 发送给接收方（带 _msg_id）
+    message_id = db_manager.save_private_message(sender_name, target_name, content)
     try:
         send_json(
             target_sock,
             {
                 "type": "private_msg",
+                "message_id": message_id,
                 "from": sender_name,
                 "content": content,
-                "_msg_id": msg_id,
             },
         )
     except OSError:
@@ -255,16 +193,20 @@ def handle_private_message(sender_sock, sender_name, message):
         )
         return
 
-    db_manager.save_private_message(sender_name, target_name, content)
-    
-    # 发送给发送方（带 msg_id，显示）
     send_json(
         sender_sock,
         {
-            "type": "private_msg",
-            "from": sender_name,
-            "content": content,
-            "msg_id": msg_id,
+            "type": "message_sent",
+            "message_id": message_id,
+            "msg_type": "private",
+            "to": target_name,
+        },
+    )
+    send_json(
+        sender_sock,
+        {
+            "type": "system",
+            "content": f"私聊消息已发送给 {target_name}",
         },
     )
 
@@ -337,6 +279,62 @@ def handle_group_leave(client_sock, username, message):
     send_json(client_sock, {"type": "system", "content": f"已退出群组 {group_name}"})
 
 
+def extract_ai_prompt(content):
+    """Return the prompt after @AI, or None when the message is not for AI."""
+    text = str(content).strip()
+    trigger_len = len(AI_TRIGGER)
+    if text[:trigger_len].lower() != AI_TRIGGER.lower():
+        return None
+
+    rest = text[trigger_len:]
+    if rest and not rest[0].isspace() and rest[0] not in ":：":
+        return None
+
+    return rest.lstrip(" :：")
+
+
+def send_group_message(group_name, sender_name, content):
+    """Send one group message to currently online members."""
+    outgoing = {
+        "type": "group_msg",
+        "group": group_name,
+        "from": sender_name,
+        "content": content,
+    }
+
+    disconnected = []
+    with clients_lock:
+        members = groups.get(group_name, set())
+        targets = [
+            (member_name, online_users[member_name])
+            for member_name in list(members)
+            if member_name in online_users
+        ]
+
+    for member_name, member_sock in targets:
+        try:
+            send_json(member_sock, outgoing)
+        except OSError:
+            disconnected.append((member_sock, member_name))
+
+    for member_sock, member_name in disconnected:
+        remove_client(member_sock, member_name)
+
+
+def handle_ai_group_reply(group_name, sender_name, prompt):
+    """Ask the LLM and send the answer back to the group."""
+    if not prompt:
+        reply = "请在 @AI 后面输入问题，例如：@AI 帮我解释一下心跳机制。"
+    else:
+        try:
+            reply = ask_llm(prompt, sender_name, group_name)
+        except Exception as exc:
+            reply = f"AI 暂时无法回复：{exc}"
+
+    send_group_message(group_name, AI_NAME, reply)
+    db_manager.save_group_message(AI_NAME, group_name, reply)
+
+
 def handle_group_message(client_sock, username, message):
     """Send a chat message to online members of one group."""
     group_name = str(message.get("group", "")).strip()
@@ -368,42 +366,98 @@ def handle_group_message(client_sock, username, message):
         send_json(client_sock, {"type": "error", "content": f"你不在群组 {group_name} 中"})
         return
 
-    msg_id = str(time.time_ns())
-    with clients_lock:
-        recent_messages[msg_id] = {
-            "sender": username,
-            "time": time.time(),
-            "type": "group",
-            "target": group_name,
-            "content": content
-        }
-
+    message_id = db_manager.save_group_message(username, group_name, content)
+    outgoing = {
+        "type": "group_msg",
+        "message_id": message_id,
+        "group": group_name,
+        "from": username,
+        "content": content,
+    }
     disconnected = []
     for member_name, member_sock in targets:
         try:
-            if member_name == username:
-                send_json(member_sock, {
-                    "type": "group_msg",
-                    "group": group_name,
-                    "from": username,
-                    "content": content,
-                    "msg_id": msg_id,
-                })
-            else:
-                send_json(member_sock, {
-                    "type": "group_msg",
-                    "group": group_name,
-                    "from": username,
-                    "content": content,
-                    "_msg_id": msg_id,
-                })
+            send_json(member_sock, outgoing)
         except OSError:
             disconnected.append((member_sock, member_name))
 
     for member_sock, member_name in disconnected:
         remove_client(member_sock, member_name)
 
-    db_manager.save_group_message(username, group_name, content)
+    send_json(
+        client_sock,
+        {
+            "type": "message_sent",
+            "message_id": message_id,
+            "msg_type": "group",
+            "group": group_name,
+        },
+    )
+
+    ai_prompt = extract_ai_prompt(content)
+    if ai_prompt is not None:
+        thread = threading.Thread(
+            target=handle_ai_group_reply,
+            args=(group_name, username, ai_prompt),
+            daemon=True,
+        )
+        thread.start()
+
+
+def handle_recall_message(client_sock, username, message):
+    """Recall one recently sent private or group message and notify recipients."""
+    message_id = message.get("message_id", message.get("id", message.get("msg_id")))
+    success, reason, recalled = db_manager.recall_message(
+        message_id,
+        username,
+        within_seconds=RECALL_WINDOW_SECONDS,
+    )
+    if not success:
+        send_json(
+            client_sock,
+            {
+                "type": "error",
+                "content": RECALL_FAILURE_MESSAGES.get(reason, "撤回失败"),
+            },
+        )
+        return
+
+    notice = {
+        "type": "recall_notice",
+        "message_id": recalled["id"],
+        "msg_type": recalled["msg_type"],
+        "from": username,
+        "content": f"{username} 撤回了一条消息",
+    }
+    target_socks = []
+
+    with clients_lock:
+        if recalled["msg_type"] == "private":
+            notice["to"] = recalled.get("receiver")
+            recipients = {recalled.get("sender"), recalled.get("receiver")}
+            target_socks = [
+                (recipient, online_users[recipient])
+                for recipient in recipients
+                if recipient in online_users
+            ]
+        elif recalled["msg_type"] == "group":
+            group_name = recalled.get("group_name")
+            notice["group"] = group_name
+            target_socks = [
+                (member_name, online_users[member_name])
+                for member_name in list(groups.get(group_name, set()))
+                if member_name in online_users
+            ]
+
+    disconnected = []
+    for recipient, sock in target_socks:
+        try:
+            send_json(sock, notice)
+        except OSError:
+            disconnected.append((sock, recipient))
+
+    for sock, recipient in disconnected:
+        remove_client(sock, recipient)
 
 
 def handle_history(client_sock, username):
@@ -417,64 +471,6 @@ def handle_history(client_sock, username):
 
     history = db_manager.get_recent_history(username, user_groups, limit=20)
     send_json(client_sock, {"type": "history", "messages": history})
-
-
-def handle_recall_request(client_sock, username, message):
-    """Handle message recall request with a 2-minute limit."""
-    msg_id = str(message.get("msg_id", "")).strip()
-
-    with clients_lock:
-        msg_info = recent_messages.get(msg_id)
-
-    if not msg_info:
-        send_json(client_sock, {"type": "error", "content": "消息不存在或已超过2分钟无法撤回"})
-        return
-
-    if msg_info["sender"] != username:
-        send_json(client_sock, {"type": "error", "content": "无权撤回他人发送的消息"})
-        return
-
-    time_diff = time.time() - msg_info["time"]
-    if time_diff > RECALL_LIMIT:
-        send_json(client_sock, {"type": "error", "content": "消息发送已超过2分钟，撤回失败"})
-        return
-
-    with clients_lock:
-        recent_messages.pop(msg_id, None)
-
-    print(f"[server] message recalled by {username}, msg_id: {msg_id}")
-
-    recall_notice = {
-        "type": "recall",
-        "msg_id": msg_id,
-        "sender": username,
-    }
-
-    # 根据消息类型广播给相关用户
-    if msg_info["type"] == "chat":
-        broadcast(recall_notice)
-    elif msg_info["type"] == "private":
-        with clients_lock:
-            for user in msg_info["target"]:
-                sock = online_users.get(user)
-                if sock:
-                    try:
-                        send_json(sock, recall_notice)
-                    except OSError:
-                        pass
-    elif msg_info["type"] == "group":
-        group_name = msg_info["target"]
-        with clients_lock:
-            members = list(groups.get(group_name, set()))
-            for member_name in members:
-                sock = online_users.get(member_name)
-                if sock:
-                    try:
-                        send_json(sock, recall_notice)
-                    except OSError:
-                        pass
-
-    send_json(client_sock, {"type": "system", "content": "消息撤回成功"})
 
 
 def handle_client(client_sock, address):
@@ -504,41 +500,17 @@ def handle_client(client_sock, address):
             msg_type = message.get("type")
 
             if msg_type == "heartbeat":
-                # 使用 SessionManager 更新心跳
-                session_manager.update_heartbeat(username)
-                
+                with clients_lock:
+                    if online_users.get(username) is client_sock:
+                        last_heartbeat[username] = time.time()
             elif msg_type == "chat":
                 text = str(message.get("content", ""))
-                
-                msg_id = str(time.time_ns())
-                with clients_lock:
-                    recent_messages[msg_id] = {
-                        "sender": username,
-                        "time": time.time(),
-                        "type": "chat",
-                        "target": None,
-                        "content": text
-                    }
-                
+                outgoing = {
+                    "type": "chat",
+                    "content": f"[{username}] {text}",
+                }
                 print(f"[server] {username}: {text}")
-                
-                for other_sock in list(online_users.values()):
-                    try:
-                        if other_sock == client_sock:
-                            send_json(other_sock, {
-                                "type": "chat",
-                                "content": f"[{username}] {text}",
-                                "msg_id": msg_id,
-                            })
-                        else:
-                            send_json(other_sock, {
-                                "type": "chat",
-                                "content": f"[{username}] {text}",
-                                "_msg_id": msg_id,
-                            })
-                    except OSError:
-                        pass
-                            
+                broadcast(outgoing)
             elif msg_type == "private_msg":
                 handle_private_message(client_sock, username, message)
             elif msg_type == "group_create":
@@ -549,10 +521,10 @@ def handle_client(client_sock, address):
                 handle_group_leave(client_sock, username, message)
             elif msg_type == "group_msg":
                 handle_group_message(client_sock, username, message)
+            elif msg_type in ("recall", "recall_message", "recall_last", "recall_request"):
+                handle_recall_message(client_sock, username, message)
             elif msg_type == "history":
                 handle_history(client_sock, username)
-            elif msg_type == "recall_request":
-                handle_recall_request(client_sock, username, message)
             elif msg_type == "online_list":
                 with clients_lock:
                     users = sorted(online_users.keys())

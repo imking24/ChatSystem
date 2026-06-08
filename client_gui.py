@@ -3,7 +3,7 @@ import socket
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
 
 HOST = "127.0.0.1"
@@ -17,7 +17,11 @@ class ChatClientGUI:
         self.root.title("分布式即时聊天系统客户端")
         self.root.geometry("1100x720")
         self.root.minsize(960, 620)
-        self.root.configure(bg="#f5f7fb")
+        self.root.configure(bg="#05070d")
+        self.is_fullscreen = False
+        self.set_fullscreen(True)
+        self.root.bind("<F11>", self.toggle_fullscreen)
+        self.root.bind("<Escape>", self.exit_fullscreen)
 
         self.sock = None
         self.connected = False
@@ -29,9 +33,9 @@ class ChatClientGUI:
         self.heartbeat_stop_event = threading.Event()
         self.receive_thread = None
         self.heartbeat_thread = None
-
-        # 存储消息ID到聊天文本位置的映射
-        self.message_map = {}  # {msg_id: (start_index, end_index, sender)}
+        self.last_sent_message_id = None
+        self.message_tags = {}
+        self.pending_private_messages = []
 
         self.chat_mode = tk.StringVar(value="private")
         self.status_var = tk.StringVar(value="未连接")
@@ -47,84 +51,350 @@ class ChatClientGUI:
         self.build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    def set_fullscreen(self, enabled):
+        self.is_fullscreen = enabled
+        try:
+            self.root.attributes("-fullscreen", enabled)
+        except tk.TclError:
+            if enabled:
+                try:
+                    self.root.state("zoomed")
+                except tk.TclError:
+                    pass
+
+    def toggle_fullscreen(self, _event=None):
+        self.set_fullscreen(not self.is_fullscreen)
+
+    def exit_fullscreen(self, _event=None):
+        if self.is_fullscreen:
+            self.set_fullscreen(False)
+
     def configure_style(self):
+        self.colors = {
+            "bg": "#05070d",
+            "sidebar": "#0a0f1c",
+            "panel": "#0d1322",
+            "panel_2": "#101827",
+            "field": "#151e2e",
+            "field_alt": "#0b1020",
+            "border": "#263247",
+            "text": "#f8fafc",
+            "muted": "#94a3b8",
+            "cyan": "#22d3ee",
+            "blue": "#60a5fa",
+            "green": "#34d399",
+            "purple": "#c084fc",
+            "pink": "#fb7185",
+            "amber": "#fbbf24",
+            "red": "#f87171",
+        }
+
         style = ttk.Style()
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
 
-        style.configure("TFrame", background="#f5f7fb")
-        style.configure("TLabelframe", background="#f5f7fb", bordercolor="#d7deea")
-        style.configure("TLabelframe.Label", background="#f5f7fb", foreground="#233044", font=("Microsoft YaHei UI", 10, "bold"))
-        style.configure("TLabel", background="#f5f7fb", foreground="#233044", font=("Microsoft YaHei UI", 9))
-        style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=(8, 4))
-        style.configure("TRadiobutton", background="#f5f7fb", foreground="#233044", font=("Microsoft YaHei UI", 9))
-        style.configure("Status.TLabel", background="#e9eef7", foreground="#233044", padding=(10, 6))
-        style.configure("Accent.TButton", font=("Microsoft YaHei UI", 9, "bold"), padding=(8, 4))
+        style.configure("TFrame", background=self.colors["bg"])
+        style.configure("Sidebar.TFrame", background=self.colors["sidebar"])
+        style.configure("Chat.TFrame", background=self.colors["panel"])
+        style.configure("Control.TFrame", background=self.colors["panel_2"])
+        style.configure("TLabel", background=self.colors["panel"], foreground=self.colors["text"], font=("Microsoft YaHei UI", 9))
+        style.configure("Sidebar.TLabel", background=self.colors["sidebar"], foreground=self.colors["muted"], font=("Microsoft YaHei UI", 9))
+        style.configure("Title.TLabel", background=self.colors["sidebar"], foreground=self.colors["text"], font=("Microsoft YaHei UI", 20, "bold"))
+        style.configure("Subtitle.TLabel", background=self.colors["sidebar"], foreground=self.colors["cyan"], font=("Microsoft YaHei UI", 9))
+        style.configure("ChatTitle.TLabel", background=self.colors["panel"], foreground=self.colors["text"], font=("Microsoft YaHei UI", 18, "bold"))
+        style.configure("Status.TLabel", background="#08111f", foreground=self.colors["green"], padding=(14, 8), font=("Microsoft YaHei UI", 9))
+
+        for name, background in (("Section", self.colors["sidebar"]), ("Chat", self.colors["panel"])):
+            style.configure(
+                f"{name}.TLabelframe",
+                background=background,
+                bordercolor=self.colors["border"],
+                borderwidth=1,
+                relief="solid",
+            )
+            style.configure(
+                f"{name}.TLabelframe.Label",
+                background=background,
+                foreground=self.colors["cyan"] if name == "Section" else self.colors["purple"],
+                font=("Microsoft YaHei UI", 10, "bold"),
+            )
+
+        style.configure(
+            "Dark.TEntry",
+            fieldbackground=self.colors["field"],
+            foreground=self.colors["text"],
+            bordercolor=self.colors["border"],
+            lightcolor=self.colors["border"],
+            darkcolor=self.colors["border"],
+            insertcolor=self.colors["text"],
+            padding=(8, 6),
+        )
+        style.map(
+            "Dark.TEntry",
+            fieldbackground=[("disabled", "#111827"), ("readonly", self.colors["field"]), ("focus", "#182235")],
+            foreground=[("disabled", self.colors["muted"])],
+            bordercolor=[("focus", self.colors["cyan"])],
+        )
+
+        style.configure("TRadiobutton", background=self.colors["panel_2"], foreground=self.colors["text"], font=("Microsoft YaHei UI", 9))
+        style.map(
+            "TRadiobutton",
+            background=[("active", self.colors["panel_2"])],
+            foreground=[("active", self.colors["cyan"]), ("selected", self.colors["cyan"])],
+            indicatorcolor=[("selected", self.colors["cyan"]), ("!selected", self.colors["field"])],
+        )
+
+        style.configure(
+            "TButton",
+            background="#172033",
+            foreground=self.colors["text"],
+            bordercolor=self.colors["border"],
+            focusthickness=0,
+            font=("Microsoft YaHei UI", 9),
+            padding=(10, 6),
+        )
+        style.map("TButton", background=[("active", "#22304a"), ("pressed", "#0f172a")], foreground=[("disabled", self.colors["muted"])])
+        style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 6))
+        style.map("Accent.TButton", background=[("active", "#3b82f6"), ("pressed", "#1d4ed8")])
+        style.configure("Success.TButton", background="#059669", foreground="#ffffff", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 6))
+        style.map("Success.TButton", background=[("active", "#10b981"), ("pressed", "#047857")])
+        style.configure("Warn.TButton", background="#d97706", foreground="#ffffff", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 6))
+        style.map("Warn.TButton", background=[("active", "#f59e0b"), ("pressed", "#b45309")])
+        style.configure("Danger.TButton", background="#be123c", foreground="#ffffff", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 6))
+        style.map("Danger.TButton", background=[("active", "#e11d48"), ("pressed", "#9f1239")])
+        style.configure("Ai.TButton", background="#7e22ce", foreground="#ffffff", font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 6))
+        style.map("Ai.TButton", background=[("active", "#a855f7"), ("pressed", "#6b21a8")])
+
+    def rounded_rect(self, canvas, x1, y1, x2, y2, radius, **options):
+        radius = max(1, min(radius, int((x2 - x1) / 2), int((y2 - y1) / 2)))
+        points = [
+            x1 + radius,
+            y1,
+            x2 - radius,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + radius,
+            x2,
+            y2 - radius,
+            x2,
+            y2,
+            x2 - radius,
+            y2,
+            x1 + radius,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - radius,
+            x1,
+            y1 + radius,
+            x1,
+            y1,
+        ]
+        return canvas.create_polygon(points, smooth=True, splinesteps=18, **options)
+
+    def glass_button(self, parent, text, command, variant="default", surface="sidebar", width=118):
+        palettes = {
+            "default": {"bg": "#172033", "hover": "#20304a", "pressed": "#101827", "border": "#4b5873", "glow": "#7c8ca8"},
+            "accent": {"bg": "#173261", "hover": "#1f4f9b", "pressed": "#102a52", "border": "#60a5fa", "glow": "#93c5fd"},
+            "success": {"bg": "#0f3f36", "hover": "#11634f", "pressed": "#0a2f29", "border": "#34d399", "glow": "#6ee7b7"},
+            "warn": {"bg": "#4b3414", "hover": "#7a4d13", "pressed": "#39270f", "border": "#fbbf24", "glow": "#fde68a"},
+            "danger": {"bg": "#501827", "hover": "#861638", "pressed": "#3f1320", "border": "#fb7185", "glow": "#fda4af"},
+            "ai": {"bg": "#351c5d", "hover": "#5b21b6", "pressed": "#2e1654", "border": "#c084fc", "glow": "#ddd6fe"},
+        }
+        surfaces = {
+            "sidebar": self.colors["sidebar"],
+            "panel": self.colors["panel"],
+            "panel_2": self.colors["panel_2"],
+        }
+        palette = palettes.get(variant, palettes["default"])
+        surface_color = surfaces.get(surface, self.colors["sidebar"])
+        state = {"hover": False, "pressed": False}
+
+        canvas = tk.Canvas(
+            parent,
+            width=width,
+            height=40,
+            bg=surface_color,
+            cursor="hand2",
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+
+        def draw():
+            width = max(canvas.winfo_width(), 80)
+            height = max(canvas.winfo_height(), 40)
+            canvas.delete("all")
+            inset = 4
+            lift = 1
+            fill = palette["bg"]
+            border = palette["border"]
+            shadow = "#080d18"
+            text_color = self.colors["text"]
+
+            if state["pressed"]:
+                fill = palette["pressed"]
+                inset = 5
+                lift = 0
+                shadow = "#060a13"
+            elif state["hover"]:
+                fill = palette["hover"]
+                border = palette["glow"]
+                inset = 3
+                lift = 2
+                shadow = "#0b1322"
+
+            self.rounded_rect(canvas, 5, 7, width - 3, height - 2, 13, fill=shadow, outline="")
+            self.rounded_rect(canvas, inset, inset - lift, width - inset - 2, height - inset - lift, 12, fill=border, outline="")
+            self.rounded_rect(canvas, inset + 1, inset + 1 - lift, width - inset - 3, height - inset - 1 - lift, 11, fill=fill, outline="")
+            canvas.create_line(
+                inset + 10,
+                inset + 4 - lift,
+                width - inset - 12,
+                inset + 4 - lift,
+                fill="#ffffff",
+                width=1,
+                stipple="gray50",
+            )
+            canvas.create_text(
+                width / 2,
+                height / 2 - lift,
+                text=text,
+                fill=text_color,
+                font=("Microsoft YaHei UI", 10),
+            )
+
+        def enter(_event=None):
+            state["hover"] = True
+            draw()
+
+        def leave(_event=None):
+            state["hover"] = False
+            state["pressed"] = False
+            draw()
+
+        def press(_event=None):
+            state["pressed"] = True
+            draw()
+
+        def release(event=None):
+            should_run = False
+            if event is not None:
+                should_run = 0 <= event.x <= canvas.winfo_width() and 0 <= event.y <= canvas.winfo_height()
+            state["pressed"] = False
+            draw()
+            if should_run and command:
+                command()
+
+        canvas.bind("<Configure>", lambda _event: draw())
+        canvas.bind("<Enter>", enter)
+        canvas.bind("<Leave>", leave)
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<ButtonRelease-1>", release)
+        draw()
+        return canvas
 
     def build_ui(self):
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        top = ttk.LabelFrame(self.root, text="连接与登录")
-        top.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
-        for index in range(14):
-            top.columnconfigure(index, weight=0)
-        top.columnconfigure(13, weight=1)
-
-        ttk.Label(top, text="服务器 IP").grid(row=0, column=0, padx=(10, 4), pady=10, sticky="w")
-        ttk.Entry(top, textvariable=self.server_ip_var, width=16).grid(row=0, column=1, padx=(0, 10), pady=10)
-        ttk.Label(top, text="端口").grid(row=0, column=2, padx=(0, 4), pady=10, sticky="w")
-        ttk.Entry(top, textvariable=self.port_var, width=8).grid(row=0, column=3, padx=(0, 10), pady=10)
-        ttk.Button(top, text="连接", width=10, command=self.connect_server).grid(row=0, column=4, padx=(0, 18), pady=10)
-
-        ttk.Label(top, text="用户名").grid(row=0, column=5, padx=(0, 4), pady=10, sticky="w")
-        ttk.Entry(top, textvariable=self.username_var, width=16).grid(row=0, column=6, padx=(0, 10), pady=10)
-        ttk.Label(top, text="密码").grid(row=0, column=7, padx=(0, 4), pady=10, sticky="w")
-        ttk.Entry(top, textvariable=self.password_var, show="*", width=16).grid(row=0, column=8, padx=(0, 10), pady=10)
-        ttk.Button(top, text="注册", width=10, command=self.register_user).grid(row=0, column=9, padx=(0, 8), pady=10)
-        ttk.Button(top, text="登录", width=10, style="Accent.TButton", command=self.login).grid(row=0, column=10, padx=(0, 10), pady=10)
-
-        main = ttk.Frame(self.root)
-        main.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
-        main.columnconfigure(0, weight=0)
-        main.columnconfigure(1, weight=1)
+        main = ttk.Frame(self.root, style="TFrame")
+        main.grid(row=0, column=0, sticky="nsew", padx=14, pady=14)
+        main.columnconfigure(0, weight=1, uniform="main")
+        main.columnconfigure(1, weight=2, uniform="main")
         main.rowconfigure(0, weight=1)
 
         self.build_left_panel(main)
         self.build_chat_panel(main)
 
         status_bar = ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w")
-        status_bar.grid(row=2, column=0, sticky="ew")
+        status_bar.grid(row=1, column=0, sticky="ew")
 
     def build_left_panel(self, parent):
-        left = ttk.LabelFrame(parent, text="在线用户 / 群组")
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        left = ttk.Frame(parent, style="Sidebar.TFrame")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         left.columnconfigure(0, weight=1)
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(4, weight=1)
 
-        ttk.Button(left, text="刷新在线列表", width=18, command=self.request_online_list).grid(
-            row=0, column=0, sticky="ew", padx=10, pady=(10, 8)
+        ttk.Label(left, text="ChatSystem", style="Title.TLabel").grid(row=0, column=0, sticky="w", padx=18, pady=(18, 0))
+        ttk.Label(left, text="连接 · 账户 · 群组", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", padx=18, pady=(0, 14))
+
+        connection = ttk.LabelFrame(left, text="服务器连接", style="Section.TLabelframe")
+        connection.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        connection.columnconfigure(0, weight=1)
+        connection.columnconfigure(1, weight=0)
+
+        ttk.Label(connection, text="服务器 IP", style="Sidebar.TLabel").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        ttk.Label(connection, text="端口", style="Sidebar.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 12), pady=(10, 4))
+        ttk.Entry(connection, textvariable=self.server_ip_var, style="Dark.TEntry").grid(row=1, column=0, sticky="ew", padx=(12, 8), pady=(0, 10))
+        ttk.Entry(connection, textvariable=self.port_var, width=8, style="Dark.TEntry").grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=(0, 10))
+        self.glass_button(connection, text="连接服务器", variant="accent", command=self.connect_server).grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12)
         )
 
-        list_frame = ttk.Frame(left)
-        list_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        account = ttk.LabelFrame(left, text="账号密码", style="Section.TLabelframe")
+        account.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
+        account.columnconfigure(0, weight=1)
+        account.columnconfigure(1, weight=1)
+
+        ttk.Label(account, text="用户名", style="Sidebar.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 4))
+        ttk.Entry(account, textvariable=self.username_var, style="Dark.TEntry").grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+        ttk.Label(account, text="密码", style="Sidebar.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 4))
+        ttk.Entry(account, textvariable=self.password_var, show="*", style="Dark.TEntry").grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+        self.glass_button(account, text="注册", variant="warn", command=self.register_user).grid(row=4, column=0, sticky="ew", padx=(12, 6), pady=(0, 12))
+        self.glass_button(account, text="登录", variant="success", command=self.login).grid(row=4, column=1, sticky="ew", padx=(6, 12), pady=(0, 12))
+
+        lower = ttk.Frame(left, style="Sidebar.TFrame")
+        lower.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        lower.columnconfigure(0, weight=1)
+        lower.rowconfigure(1, weight=1)
+
+        group_frame = ttk.LabelFrame(lower, text="创建群聊", style="Section.TLabelframe")
+        group_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        group_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(group_frame, text="群名", style="Sidebar.TLabel").grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+        ttk.Entry(group_frame, textvariable=self.group_var, style="Dark.TEntry").grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+
+        buttons = ttk.Frame(group_frame, style="Sidebar.TFrame")
+        buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        for index in range(3):
+            buttons.columnconfigure(index, weight=1)
+        self.glass_button(buttons, text="建群", variant="accent", command=self.create_group).grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.glass_button(buttons, text="入群", variant="success", command=self.join_group).grid(row=0, column=1, padx=5, sticky="ew")
+        self.glass_button(buttons, text="退群", variant="danger", command=self.leave_group).grid(row=0, column=2, padx=(5, 0), sticky="ew")
+
+        online = ttk.LabelFrame(lower, text="在线用户", style="Section.TLabelframe")
+        online.grid(row=1, column=0, sticky="nsew")
+        online.columnconfigure(0, weight=1)
+        online.rowconfigure(1, weight=1)
+
+        self.glass_button(online, text="刷新在线列表", command=self.request_online_list).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 8))
+
+        list_frame = ttk.Frame(online, style="Sidebar.TFrame")
+        list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
 
         self.user_listbox = tk.Listbox(
             list_frame,
-            width=28,
+            width=24,
             height=20,
             activestyle="dotbox",
-            bg="#ffffff",
-            fg="#1f2937",
-            selectbackground="#dbeafe",
-            selectforeground="#0f172a",
-            relief="solid",
-            borderwidth=1,
-            highlightthickness=0,
+            bg=self.colors["field_alt"],
+            fg=self.colors["text"],
+            selectbackground="#155e75",
+            selectforeground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["cyan"],
+            highlightthickness=1,
             font=("Microsoft YaHei UI", 10),
         )
         self.user_listbox.grid(row=0, column=0, sticky="nsew")
@@ -134,40 +404,30 @@ class ChatClientGUI:
         user_scrollbar.grid(row=0, column=1, sticky="ns")
         self.user_listbox.configure(yscrollcommand=user_scrollbar.set)
 
-        group_frame = ttk.Frame(left)
-        group_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-        group_frame.columnconfigure(0, weight=1)
-
-        ttk.Label(group_frame, text="群名").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        ttk.Entry(group_frame, textvariable=self.group_var).grid(row=1, column=0, sticky="ew", pady=(0, 8))
-
-        buttons = ttk.Frame(group_frame)
-        buttons.grid(row=2, column=0, sticky="ew")
-        for index in range(3):
-            buttons.columnconfigure(index, weight=1)
-        ttk.Button(buttons, text="建群", width=8, command=self.create_group).grid(row=0, column=0, padx=(0, 4), sticky="ew")
-        ttk.Button(buttons, text="入群", width=8, command=self.join_group).grid(row=0, column=1, padx=4, sticky="ew")
-        ttk.Button(buttons, text="退群", width=8, command=self.leave_group).grid(row=0, column=2, padx=(4, 0), sticky="ew")
-
     def build_chat_panel(self, parent):
-        right = ttk.LabelFrame(parent, text="聊天窗口")
+        right = ttk.Frame(parent, style="Chat.TFrame")
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
 
-        controls = ttk.Frame(right)
-        controls.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        header = ttk.Frame(right, style="Chat.TFrame")
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 8))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="聊天主界面", style="ChatTitle.TLabel").grid(row=0, column=0, sticky="w")
+
+        controls = ttk.Frame(right, style="Control.TFrame")
+        controls.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
         controls.columnconfigure(1, weight=1)
 
-        ttk.Label(controls, text="目标").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Entry(controls, textvariable=self.target_var).grid(row=0, column=1, sticky="ew", padx=(0, 10))
-        ttk.Radiobutton(controls, text="私聊", variable=self.chat_mode, value="private").grid(row=0, column=2, padx=(0, 6))
-        ttk.Radiobutton(controls, text="群聊", variable=self.chat_mode, value="group").grid(row=0, column=3, padx=(0, 12))
-        ttk.Button(controls, text="拉取历史", width=10, command=self.request_history).grid(row=0, column=4, padx=(0, 8))
-        ttk.Button(controls, text="撤回消息", width=12, command=self.recall_message).grid(row=0, column=5)
+        ttk.Label(controls, text="目标", background=self.colors["panel_2"], foreground=self.colors["muted"]).grid(row=0, column=0, sticky="w", padx=(12, 6), pady=12)
+        ttk.Entry(controls, textvariable=self.target_var, style="Dark.TEntry").grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=12)
+        ttk.Radiobutton(controls, text="私聊", variable=self.chat_mode, value="private").grid(row=0, column=2, padx=(0, 8), pady=12)
+        ttk.Radiobutton(controls, text="群聊", variable=self.chat_mode, value="group").grid(row=0, column=3, padx=(0, 14), pady=12)
+        self.glass_button(controls, text="查找历史", variant="warn", surface="panel_2", command=self.request_history).grid(row=0, column=4, padx=(0, 8), pady=12)
+        self.glass_button(controls, text="撤回上一条", variant="danger", surface="panel_2", command=self.recall_last).grid(row=0, column=5, padx=(0, 12), pady=12)
 
-        chat_frame = ttk.Frame(right)
-        chat_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        chat_frame = ttk.LabelFrame(right, text="消息", style="Chat.TLabelframe")
+        chat_frame.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 12))
         chat_frame.columnconfigure(0, weight=1)
         chat_frame.rowconfigure(0, weight=1)
 
@@ -175,42 +435,44 @@ class ChatClientGUI:
             chat_frame,
             wrap="word",
             state="disabled",
-            bg="#ffffff",
-            fg="#111827",
-            relief="solid",
-            borderwidth=1,
-            padx=10,
-            pady=10,
+            bg="#070b14",
+            fg=self.colors["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["purple"],
+            highlightthickness=1,
+            insertbackground=self.colors["text"],
+            padx=14,
+            pady=12,
             font=("Microsoft YaHei UI", 10),
             spacing1=2,
-            spacing3=4,
+            spacing3=6,
         )
-        self.chat_text.grid(row=0, column=0, sticky="nsew")
+        self.chat_text.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
 
         chat_scrollbar = ttk.Scrollbar(chat_frame, orient="vertical", command=self.chat_text.yview)
-        chat_scrollbar.grid(row=0, column=1, sticky="ns")
+        chat_scrollbar.grid(row=0, column=1, sticky="ns", pady=12)
         self.chat_text.configure(yscrollcommand=chat_scrollbar.set)
         self.configure_text_tags()
 
-        input_frame = ttk.Frame(right)
-        input_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        input_frame = ttk.Frame(right, style="Control.TFrame")
+        input_frame.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 18))
         input_frame.columnconfigure(0, weight=1)
 
-        self.message_entry = ttk.Entry(input_frame, textvariable=self.message_var)
-        self.message_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.message_entry = ttk.Entry(input_frame, textvariable=self.message_var, style="Dark.TEntry")
+        self.message_entry.grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=12)
         self.message_entry.bind("<Return>", lambda _event: self.send_message())
-        ttk.Button(input_frame, text="发送", width=10, style="Accent.TButton", command=self.send_message).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(input_frame, text="发送文件", width=10, command=self.send_file).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(input_frame, text="@AI", width=8, command=self.send_ai_message).grid(row=0, column=3)
+        self.glass_button(input_frame, text="发送", variant="accent", surface="panel_2", width=72, command=self.send_message).grid(row=0, column=1, padx=(0, 6), pady=12)
+        self.glass_button(input_frame, text="@AI", variant="ai", surface="panel_2", width=62, command=self.send_ai_message).grid(row=0, column=2, padx=(0, 12), pady=12)
 
     def configure_text_tags(self):
-        self.chat_text.tag_configure("system", foreground="#6b7280")
-        self.chat_text.tag_configure("error", foreground="#dc2626")
-        self.chat_text.tag_configure("private", foreground="#2563eb")
-        self.chat_text.tag_configure("group", foreground="#16a34a")
-        self.chat_text.tag_configure("ai", foreground="#9333ea")
-        self.chat_text.tag_configure("normal", foreground="#111827")
-        self.chat_text.tag_configure("recall", foreground="#ef4444", font=("Microsoft YaHei UI", 9, "italic"))
+        self.chat_text.tag_configure("system", foreground=self.colors["muted"])
+        self.chat_text.tag_configure("error", foreground=self.colors["red"])
+        self.chat_text.tag_configure("private", foreground=self.colors["blue"])
+        self.chat_text.tag_configure("group", foreground=self.colors["green"])
+        self.chat_text.tag_configure("ai", foreground=self.colors["purple"])
+        self.chat_text.tag_configure("normal", foreground=self.colors["text"])
 
     def set_status(self, text):
         if threading.current_thread() is threading.main_thread():
@@ -218,63 +480,64 @@ class ChatClientGUI:
         else:
             self.root.after(0, self.status_var.set, text)
 
-    def append_message(self, text, tag=None, msg_id=None, sender=None):
-        """添加消息到聊天框，如果提供了msg_id则记录位置"""
+    def append_message(self, text, tag=None):
         tag = tag or "normal"
 
         def update():
             self.chat_text.configure(state="normal")
-            start_pos = self.chat_text.index("end-1c")
             self.chat_text.insert("end", text + "\n", tag)
-            end_pos = self.chat_text.index("end-1c")
             self.chat_text.configure(state="disabled")
             self.chat_text.see("end")
-            
-            if msg_id:
-                self.message_map[msg_id] = (start_pos, end_pos, sender)
 
         if threading.current_thread() is threading.main_thread():
             update()
         else:
             self.root.after(0, update)
 
-    def delete_message_by_id(self, msg_id):
-        """根据消息ID删除聊天框中的消息"""
-        if msg_id not in self.message_map:
-            return False
-        
-        start_pos, end_pos, sender = self.message_map[msg_id]
-        
-        def delete():
-            self.chat_text.configure(state="normal")
-            self.chat_text.delete(start_pos, end_pos)
-            line_end = self.chat_text.index(f"{start_pos} lineend + 1c")
-            self.chat_text.delete(start_pos, line_end)
-            self.chat_text.configure(state="disabled")
-            del self.message_map[msg_id]
-        
-        self.root.after(0, delete)
-        return True
+    def append_tracked_message(self, text, tag=None, message_id=None, record_tag=None):
+        tag = tag or "normal"
+        if record_tag is None:
+            record_tag = f"msg_{int(time.time() * 1000)}_{len(self.message_tags)}"
+        tags = (tag, record_tag)
 
-    def replace_with_recall_notice(self, msg_id, sender):
-        """将消息替换为撤回提示"""
-        if msg_id not in self.message_map:
-            return False
-        
-        start_pos, end_pos, msg_sender = self.message_map[msg_id]
-        
-        def replace():
+        def update():
             self.chat_text.configure(state="normal")
-            self.chat_text.delete(start_pos, end_pos)
-            line_end = self.chat_text.index(f"{start_pos} lineend + 1c")
-            self.chat_text.delete(start_pos, line_end)
-            recall_text = f"「{sender} 撤回了消息」\n"
-            self.chat_text.insert(start_pos, recall_text, "recall")
+            self.chat_text.insert("end", text + "\n", tags)
             self.chat_text.configure(state="disabled")
-            new_end = self.chat_text.index(f"{start_pos} lineend + 1c")
-            self.message_map[msg_id] = (start_pos, new_end, msg_sender)
-        
-        self.root.after(0, replace)
+            self.chat_text.see("end")
+
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            self.root.after(0, update)
+
+        if message_id is not None:
+            self.message_tags[str(message_id)] = record_tag
+        return record_tag
+
+    def replace_tracked_message(self, message_id, text, tag=None):
+        record_tag = self.message_tags.pop(str(message_id), None)
+        if not record_tag:
+            return False
+
+        tag = tag or "system"
+
+        def update():
+            ranges = self.chat_text.tag_ranges(record_tag)
+            if not ranges:
+                return
+            start = ranges[0]
+            end = ranges[-1]
+            self.chat_text.configure(state="normal")
+            self.chat_text.delete(start, end)
+            self.chat_text.insert(start, text + "\n", tag)
+            self.chat_text.configure(state="disabled")
+            self.chat_text.see("end")
+
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            self.root.after(0, update)
         return True
 
     def connect_server(self):
@@ -313,51 +576,20 @@ class ChatClientGUI:
         self.append_message(f"[系统] 已连接到 {host}:{port}", "system")
 
     def register_user(self):
-        """发送注册请求"""
-        if not self.ensure_connected():
-            return
-
-        username = self.username_var.get().strip()
-        password = self.password_var.get().strip()
-
-        if not username:
-            self.set_status("错误：用户名不能为空")
-            return
-        if not password:
-            self.set_status("错误：密码不能为空")
-            return
-        if len(password) < 6:
-            self.set_status("错误：密码长度不能少于6位")
-            return
-
-        self.send_json({
-            "type": "register",
-            "username": username,
-            "password": password
-        })
-        self.set_status("正在注册...")
+        self.append_message("[系统] 当前 server.py 未处理 register 消息，请直接使用用户名登录；密码输入框已保留用于后续服务器扩展。", "system")
+        self.set_status("注册功能待服务器接入")
 
     def login(self):
-        """发送登录请求"""
         if not self.ensure_connected():
             return
 
         username = self.username_var.get().strip()
-        password = self.password_var.get().strip()
-
         if not username:
             self.set_status("错误：用户名不能为空")
-            return
-        if not password:
-            self.set_status("错误：密码不能为空")
             return
 
         self.username = username
-        self.send_json({
-            "type": "login",
-            "username": username,
-            "password": password
-        })
+        self.send_json({"type": "login", "username": username})
 
     def ensure_connected(self):
         if not self.connected or self.sock is None:
@@ -409,30 +641,15 @@ class ChatClientGUI:
 
     def handle_server_message(self, message):
         msg_type = message.get("type")
-        
-        msg_id = message.get("msg_id") or message.get("_msg_id")
-        msg_sender = message.get("from") or message.get("sender")
-        
-        show_id = False
-        if msg_id and message.get("msg_id"):
-            if msg_sender == self.username:
-                show_id = True
-        
-        id_prefix = f"[ID: {msg_id}] " if show_id else ""
 
         if msg_type == "system":
             self.append_message(f"[系统] {message.get('content', '')}", "system")
         elif msg_type == "error":
             content = message.get("content", "")
+            if self.pending_private_messages:
+                self.pending_private_messages.pop(0)
             self.append_message(f"[错误] {content}", "error")
             self.set_status(f"错误：{content}")
-        elif msg_type == "register_success":
-            self.append_message(f"[系统] {message.get('content', '注册成功')}", "system")
-            self.set_status("注册成功，请登录")
-        elif msg_type == "register_failed":
-            content = message.get("content", "")
-            self.append_message(f"[错误] {content}", "error")
-            self.set_status(f"注册失败：{content}")
         elif msg_type == "login_success":
             self.logged_in = True
             content = message.get("content", "登录成功")
@@ -444,41 +661,55 @@ class ChatClientGUI:
             content = message.get("content", "")
             self.logged_in = False
             self.append_message(f"[错误] {content}", "error")
-            self.set_status(f"登录失败：{content}")
+            self.set_status(f"错误：{content}")
         elif msg_type in ("online_list", "online"):
             users = message.get("users", [])
             self.update_online_users(users)
             self.set_status("在线列表已刷新")
         elif msg_type in ("private_msg", "msg"):
+            message_id = message.get("message_id")
             sender = message.get("from", "unknown")
             content = message.get("content", "")
-            self.append_message(f"[私聊]{id_prefix}[{sender}] {content}", "private", msg_id=msg_id, sender=sender)
+            self.append_tracked_message(f"[私聊][{sender}] {content}", "private", message_id=message_id)
         elif msg_type in ("group_msg", "gmsg"):
+            message_id = message.get("message_id")
             group = message.get("group", "unknown")
             sender = message.get("from", "unknown")
             content = message.get("content", "")
-            self.append_message(f"[群聊][{group}]{id_prefix}[{sender}] {content}", "group", msg_id=msg_id, sender=sender)
+            self.append_tracked_message(f"[群聊][{group}][{sender}] {content}", "group", message_id=message_id)
+        elif msg_type == "message_sent":
+            message_id = message.get("message_id")
+            if message_id is not None:
+                self.last_sent_message_id = message_id
+                if message.get("msg_type") == "private" and self.pending_private_messages:
+                    pending = self.pending_private_messages.pop(0)
+                    self.append_tracked_message(
+                        f"[我 -> {pending['target']}] {pending['content']}",
+                        "private",
+                        message_id=message_id,
+                    )
+                self.set_status(f"最近消息 ID：{message_id}，2 分钟内可撤回")
+        elif msg_type == "recall_notice":
+            message_id = message.get("message_id")
+            sender = message.get("from", "unknown")
+            if message_id == self.last_sent_message_id:
+                self.last_sent_message_id = None
+            replaced = self.replace_tracked_message(message_id, f"[撤回] {sender} 撤回了一条消息", "system")
+            if not replaced:
+                self.append_message(f"[撤回] {sender} 撤回了一条消息", "system")
         elif msg_type == "chat":
-            content = message.get("content", "")
-            self.append_message(f"{id_prefix}{content}", "normal", msg_id=msg_id, sender=msg_sender)
+            self.append_message(message.get("content", ""), "normal")
         elif msg_type == "history":
             self.display_history(message.get("messages", []))
         elif msg_type == "ai_response":
             self.append_message(f"[AI助手] {message.get('content', '')}", "ai")
-        elif msg_type == "recall":
-            sender = message.get("sender", "未知用户")
-            recalled_id = message.get("msg_id", "未知")
-            self.append_message(f"【撤回提示】: 用户 {sender} 撤回了一条消息", "recall")
-            self.replace_with_recall_notice(recalled_id, sender)
         else:
-            if "content" in message:
-                self.append_message(message.get("content"), "normal")
+            self.append_message(f"[调试] {json.dumps(message, ensure_ascii=False)}", "normal")
 
     def update_online_users(self, users):
         self.user_listbox.delete(0, "end")
         for user in users:
-            #if user != self.username:
-                self.user_listbox.insert("end", user)
+            self.user_listbox.insert("end", user)
 
     def display_history(self, messages):
         if not messages:
@@ -491,18 +722,15 @@ class ChatClientGUI:
             msg_type = item.get("msg_type", "")
             sender = item.get("sender", "")
             content = item.get("content", "")
-            msg_id = item.get("msg_id", "")
-            show_id = (sender == self.username)
-            id_prefix = f"[ID: {msg_id}] " if show_id and msg_id else ""
 
             if msg_type == "private":
                 receiver = item.get("receiver", "")
-                self.append_message(f"[历史][私聊]{id_prefix}[{timestamp}][{sender} -> {receiver}] {content}", "private")
+                self.append_message(f"[历史][私聊][{timestamp}][{sender} -> {receiver}] {content}", "private")
             elif msg_type == "group":
                 group = item.get("group_name", "")
-                self.append_message(f"[历史][群聊]{id_prefix}[{timestamp}][{group}][{sender}] {content}", "group")
+                self.append_message(f"[历史][群聊][{timestamp}][{group}][{sender}] {content}", "group")
             else:
-                self.append_message(f"[历史]{id_prefix}[{timestamp}] {content}", "normal")
+                self.append_message(f"[历史][{timestamp}] {content}", "normal")
 
     def format_timestamp(self, timestamp):
         if not timestamp:
@@ -565,34 +793,12 @@ class ChatClientGUI:
         if self.send_json({"type": "history"}):
             self.set_status("正在拉取历史消息")
 
-    def recall_message(self):
-        if not self.logged_in:
-            self.set_status("错误：请先登录")
+    def recall_last(self):
+        if self.last_sent_message_id is None:
+            self.set_status("暂无可撤回的最近消息")
             return
-
-        input_dialog = tk.Toplevel(self.root)
-        input_dialog.title("消息撤回")
-        input_dialog.geometry("380x150")
-        input_dialog.resizable(False, False)
-        input_dialog.transient(self.root)
-        input_dialog.grab_set()
-
-        ttk.Label(input_dialog, text="请输入要撤回的消息ID (2分钟内):").pack(pady=12)
-        id_var = tk.StringVar()
-        entry = ttk.Entry(input_dialog, textvariable=id_var, width=32)
-        entry.pack(pady=5)
-        entry.focus_set()
-
-        def confirm():
-            target_id = id_var.get().strip()
-            if not target_id:
-                messagebox.showwarning("提示", "ID不能为空")
-                return
-            input_dialog.destroy()
-            self.send_json({"type": "recall_request", "msg_id": target_id})
-            self.set_status(f"已发送撤回请求，ID: {target_id}")
-
-        ttk.Button(input_dialog, text="确定撤回", command=confirm).pack(pady=12)
+        if self.send_json({"type": "recall", "message_id": self.last_sent_message_id}):
+            self.set_status("已发送撤回请求")
 
     def send_message(self):
         target = self.target_var.get().strip()
@@ -617,10 +823,8 @@ class ChatClientGUI:
         if self.send_json(data):
             self.message_var.set("")
             self.set_status("发送成功")
-
-    def send_file(self):
-        self.append_message("[系统] 文件发送功能待接入", "system")
-        self.set_status("文件发送功能待接入")
+            if mode == "private":
+                self.pending_private_messages.append({"target": target, "content": content})
 
     def send_ai_message(self):
         if self.chat_mode.get() != "group":
@@ -693,4 +897,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
